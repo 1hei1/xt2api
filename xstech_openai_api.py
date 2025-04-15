@@ -202,7 +202,7 @@ class SessionManager:
                     session_id = str(result["data"]["id"])
                     self.sessions[session_id] = {
                         "cookie_id": cookie["id"],
-                        "model": result["data"]["model"],
+                        "model": model,
                         "xstech_session_id": session_id,
                         "created_at": datetime.now(),
                         "messages": []
@@ -411,23 +411,44 @@ class XSTechClient:
                 "accept": "application/json, text/plain, */*",
                 "authorization": cookie["data"]["authorization"],
                 "content-type": "application/json",
-                "x-app-version": "2.1.1"
+                "x-app-version": "2.1.1",
+                "cache-control": "no-cache",
+                "pragma": "no-cache",
+                "sec-ch-ua": "\"Google Chrome\";v=\"135\", \"Not-A.Brand\";v=\"8\", \"Chromium\";v=\"135\"",
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": "\"Windows\"",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "referer": "https://xstech.one/chat"
             }
             
-            # 构建请求体，保留现有会话设置但更新模型
+            # 获取会话创建时间
+            created_time = session_data.get("created_at", datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+            updated_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # 构建请求体，包含所有必要参数
             body = {
                 "id": int(xstech_session_id),
+                "created": created_time,
+                "updated": updated_time,
+                "uid": 0,  # 默认值，实际应该从会话数据获取
+                "name": "新对话",
                 "model": new_model,
-                # 可以添加更多默认参数
+                "maxToken": 0,
                 "contextCount": 10,
                 "temperature": 0,
                 "presencePenalty": 0,
                 "frequencyPenalty": 0,
                 "prompt": "",
+                "topSort": 0,
+                "icon": "",
                 "plugins": None,
                 "localPlugins": None,
                 "useAppId": 0
             }
+            
+            logger.debug(f"更新会话模型请求体: {body}")
             
             async with aiohttp.ClientSession() as session:
                 async with session.put(
@@ -436,18 +457,21 @@ class XSTechClient:
                     json=body
                 ) as response:
                     if response.status != 200:
+                        logger.error(f"更新会话模型失败，状态码: {response.status}")
                         return False
                     
                     result = await response.json()
                     if result.get("code") != 0:
+                        logger.error(f"更新会话模型API错误: {result.get('msg', '未知错误')}")
                         return False
                     
                     # 更新本地会话记录
                     session_data["model"] = new_model
+                    logger.info(f"会话 {session_id} 模型成功更新为 {new_model}")
                     return True
                 
         except Exception as e:
-            logger.error(f"更新会话模型失败: {e}")
+            logger.error(f"更新会话模型失败: {e}", exc_info=True)
             return False
 
 # 处理图片数据
