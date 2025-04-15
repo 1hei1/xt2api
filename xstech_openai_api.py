@@ -13,6 +13,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
+import ujson
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -158,8 +159,17 @@ class SessionManager:
                 self.last_activity[session_id] = time.time()
                 return session_id
         
-        # 需要创建新会话
-        return await self.create_session(conversation_id, model)
+        # 只在创建新会话时加锁，而不是整个获取过程
+        async with asyncio.Lock():
+            # 再次检查，避免竞态条件
+            if conversation_id in self.conversation_to_session:
+                session_id = self.conversation_to_session[conversation_id]
+                if session_id in self.sessions:
+                    self.last_activity[session_id] = time.time()
+                    return session_id
+            
+            # 创建新会话
+            return await self.create_session(conversation_id, model)
     
     async def create_session(self, conversation_id: str, model: str) -> str:
         """创建新的xstech会话"""
@@ -236,9 +246,17 @@ class XSTechClient:
         self.session_manager = session_manager
         self.model_map = {}  # 将在初始化时填充
         self.reverse_model_map = {}  # 反向映射
+        self.models_cache = None
+        self.models_cache_time = 0
+        self.models_cache_ttl = 3600  # 缓存1小时
         
     async def fetch_models(self):
-        """获取xstech支持的模型列表"""
+        """获取xstech支持的模型列表，优先使用缓存"""
+        current_time = time.time()
+        if (self.models_cache is not None and 
+            current_time - self.models_cache_time < self.models_cache_ttl):
+            return self.models_cache
+            
         cookie = self.cookie_pool.get_cookie()
         if not cookie:
             raise HTTPException(status_code=503, detail="No available cookies")
@@ -280,6 +298,10 @@ class XSTechClient:
                             })
                     
                     self.cookie_pool.release_cookie(cookie["id"])
+                    
+                    # 更新缓存
+                    self.models_cache = models
+                    self.models_cache_time = current_time
                     return models
                     
         except Exception as e:
@@ -430,31 +452,30 @@ class XSTechClient:
 
 # 处理图片数据
 def process_image_content(content: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """处理OpenAI格式的图片内容，转换为xstech格式"""
+    """优化的图片处理函数"""
     files = []
     for item in content:
-        if item.get("type") == "image_url":
-            image_url = item.get("image_url", {})
-            if isinstance(image_url, dict) and "url" in image_url:
-                # 处理base64图片
-                if image_url["url"].startswith("data:image/"):
-                    parts = image_url["url"].split(",", 1)
-                    if len(parts) == 2:
-                        image_data = parts[1]
-                        name = f"image_{len(files)}.png"
-                        files.append({
-                            "name": name,
-                            "data": image_url["url"]
-                        })
-            elif isinstance(image_url, str) and image_url.startswith("data:image/"):
-                parts = image_url.split(",", 1)
+        if item.get("type") != "image_url":
+            continue
+            
+        image_url = item.get("image_url", {})
+        url = None
+        
+        # 统一逻辑处理
+        if isinstance(image_url, dict):
+            url = image_url.get("url")
+        elif isinstance(image_url, str):
+            url = image_url
+            
+        if url and url.startswith("data:image/"):
+            try:
+                parts = url.split(",", 1)
                 if len(parts) == 2:
-                    image_data = parts[1]
                     name = f"image_{len(files)}.png"
-                    files.append({
-                        "name": name,
-                        "data": image_url
-                    })
+                    files.append({"name": name, "data": url})
+            except Exception as e:
+                logger.error(f"图片处理错误: {e}")
+                
     return files
 
 # 创建API应用
@@ -601,74 +622,73 @@ async def create_chat_completion(request: ChatCompletionRequest, background_task
                         usage_info = {}
                         stream_error = False
                         try:
-                            # 处理SSE流
-                            async for line in response.content:
-                                line = line.decode('utf-8').strip()
-                                logger.debug(f"Stream raw line: {line}") # Debug log
-                                if not line:
-                                    continue
-
-                                if line.startswith("data: "):
-                                    data_text = line[6:]
-                                    if data_text == "[DONE]":
-                                        logger.info(f"Stream finished for session {session_id}")
-                                        break
-                                    
-                                    try:
-                                        data = json.loads(data_text)
-                                        logger.debug(f"Stream data: {data}") # Debug log
+                            buffer = b""
+                            async for chunk in response.content.iter_any():
+                                buffer += chunk
+                                while b"\n\n" in buffer:
+                                    line, buffer = buffer.split(b"\n\n", 1)
+                                    line = line.decode('utf-8').strip()
+                                    if line.startswith("data: "):
+                                        data_text = line[6:]
+                                        if data_text == "[DONE]":
+                                            logger.info(f"Stream finished for session {session_id}")
+                                            break
                                         
-                                        # 处理字符串类型的数据
-                                        if data.get("type") == "string" and "data" in data:
-                                            chunk_content = data["data"]
-                                            ai_response += chunk_content
+                                        try:
+                                            data = ujson.loads(data_text)
+                                            logger.debug(f"Stream data: {data}") # Debug log
                                             
-                                            # 创建OpenAI格式的流式响应
-                                            completion_chunk = {
-                                                "id": f"chatcmpl-{str(uuid.uuid4())}",
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": request.model,
-                                                "choices": [
-                                                    {
-                                                        "index": 0,
-                                                        "delta": { "content": chunk_content },
-                                                        "finish_reason": None
-                                                    }
-                                                ]
-                                            }
-                                            yield f"data: {json.dumps(completion_chunk)}\n\n"
-                                        
-                                        # 处理对象类型的数据（最后一条包含token使用情况）
-                                        elif data.get("type") == "object" and "data" in data:
-                                             # 记录最终的对象数据以备调试
-                                            logger.info(f"Stream final object data: {data['data']}")
-                                            usage_info = {
-                                                "prompt_tokens": data["data"].get("promptTokens", 0),
-                                                "completion_tokens": data["data"].get("completionTokens", 0),
-                                                "total_tokens": data["data"].get("useTokens", 0)
-                                            }
+                                            # 处理字符串类型的数据
+                                            if data.get("type") == "string" and "data" in data:
+                                                chunk_content = data["data"]
+                                                ai_response += chunk_content
+                                                
+                                                # 创建OpenAI格式的流式响应
+                                                completion_chunk = {
+                                                    "id": f"chatcmpl-{str(uuid.uuid4())}",
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": request.model,
+                                                    "choices": [
+                                                        {
+                                                            "index": 0,
+                                                            "delta": { "content": chunk_content },
+                                                            "finish_reason": None
+                                                        }
+                                                    ]
+                                                }
+                                                yield f"data: {ujson.dumps(completion_chunk)}\n\n"
                                             
-                                            # 发送最后一个chunk标记完成
-                                            final_chunk = {
-                                                "id": f"chatcmpl-{str(uuid.uuid4())}",
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": request.model,
-                                                "choices": [
-                                                    { "index": 0, "delta": {}, "finish_reason": "stop" }
-                                                ]
-                                            }
-                                            yield f"data: {json.dumps(final_chunk)}\n\n"
-                                            
-                                    except json.JSONDecodeError:
-                                        logger.error(f"Failed to parse SSE data: {data_text}")
-                                    except Exception as parse_err:
-                                        logger.error(f"Error processing SSE data chunk: {parse_err}", exc_info=True)
-                                        stream_error = True
-                                        break # Stop processing stream on error
-                                else:
-                                     logger.warning(f"Received non-SSE line: {line}") # Log unexpected lines
+                                            # 处理对象类型的数据（最后一条包含token使用情况）
+                                            elif data.get("type") == "object" and "data" in data:
+                                                 # 记录最终的对象数据以备调试
+                                                logger.info(f"Stream final object data: {data['data']}")
+                                                usage_info = {
+                                                    "prompt_tokens": data["data"].get("promptTokens", 0),
+                                                    "completion_tokens": data["data"].get("completionTokens", 0),
+                                                    "total_tokens": data["data"].get("useTokens", 0)
+                                                }
+                                                
+                                                # 发送最后一个chunk标记完成
+                                                final_chunk = {
+                                                    "id": f"chatcmpl-{str(uuid.uuid4())}",
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": request.model,
+                                                    "choices": [
+                                                        { "index": 0, "delta": {}, "finish_reason": "stop" }
+                                                    ]
+                                                }
+                                                yield f"data: {ujson.dumps(final_chunk)}\n\n"
+                                                
+                                        except json.JSONDecodeError:
+                                            logger.error(f"Failed to parse SSE data: {data_text}")
+                                        except Exception as parse_err:
+                                            logger.error(f"Error processing SSE data chunk: {parse_err}", exc_info=True)
+                                            stream_error = True
+                                            break # Stop processing stream on error
+                                    else:
+                                         logger.warning(f"Received non-SSE line: {line}") # Log unexpected lines
 
                             # 只有在流成功完成且有响应时才记录历史
                             if not stream_error and ai_response:
@@ -713,7 +733,7 @@ async def create_chat_completion(request: ChatCompletionRequest, background_task
                                 break
                             
                             try:
-                                data = json.loads(data_text)
+                                data = ujson.loads(data_text)
                                 logger.debug(f"Non-stream data: {data}") # Debug log
                                 
                                 # 处理字符串类型的数据
@@ -806,4 +826,21 @@ async def health_check():
 # 主函数
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("xstech_openai_api:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("xstech_openai_api:app", host="0.0.0.0", port=2888, reload=True) 
+
+class ConnectionPool:
+    def __init__(self):
+        self.session = None
+        self._lock = asyncio.Lock()
+        
+    async def get_session(self) -> aiohttp.ClientSession:
+        async with self._lock:
+            if self.session is None or self.session.closed:
+                self.session = aiohttp.ClientSession(
+                    connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+                )
+            return self.session
+            
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close() 
