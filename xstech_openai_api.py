@@ -288,8 +288,8 @@ class XSTechClient:
             logger.error(f"Error fetching models: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to fetch models: {str(e)}")
     
-    async def send_chat_completion(self, session_id: str, text: str, files: List[Dict[str, str]] = None) -> aiohttp.ClientResponse:
-        """发送聊天补全请求到xstech API"""
+    async def send_chat_completion(self, session_id: str, text: str, files: List[Dict[str, str]] = None) -> tuple[aiohttp.ClientSession, aiohttp.ClientResponse]:
+        """发送聊天补全请求到xstech API，并返回session和response"""
         if session_id not in self.session_manager.sessions:
             raise HTTPException(status_code=404, detail="Session not found")
             
@@ -298,17 +298,25 @@ class XSTechClient:
         cookie = next((c for c in self.cookie_pool.cookies if c["id"] == cookie_id), None)
         
         if not cookie:
-            raise HTTPException(status_code=503, detail="Session cookie not available")
+            # 如果找不到cookie，可能需要释放会话或采取其他措施
+            logger.error(f"Cookie {cookie_id} not found for session {session_id}")
+            raise HTTPException(status_code=503, detail="Session cookie not available or invalid")
             
+        # 标记cookie正在使用
         self.cookie_pool.in_use[cookie_id] = True
         xstech_session_id = session_data["xstech_session_id"]
         
+        http_session = None # Initialize http_session to None
         try:
             headers = {
                 "accept": "text/event-stream",
                 "authorization": cookie["data"]["authorization"],
                 "content-type": "application/json",
-                "x-app-version": "2.1.1"
+                "x-app-version": "2.1.1",
+                # 添加一些常见的浏览器头，可能有助于防止被服务器拒绝
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Referer": "https://xstech.one/chat",
+                "Origin": "https://xstech.one"
             }
             
             payload = {
@@ -317,24 +325,49 @@ class XSTechClient:
                 "files": files or []
             }
             
-            async with aiohttp.ClientSession() as session:
-                response = await session.post(
-                    "https://xstech.one/api/chat/completions",
-                    headers=headers,
-                    json=payload
-                )
+            # 手动创建 aiohttp session
+            http_session = aiohttp.ClientSession()
+            
+            response = await http_session.post(
+                "https://xstech.one/api/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=300) # 增加超时时间
+            )
+            
+            # 检查状态码
+            if response.status != 200:
+                error_detail = f"XSTech API request failed with status {response.status}. Response: {await response.text()}"
+                logger.error(error_detail)
+                await http_session.close() # 确保关闭session
+                self.cookie_pool.release_cookie(cookie_id, error=True)
+                raise HTTPException(status_code=response.status, detail="XSTech API request failed")
                 
-                if response.status != 200:
-                    self.cookie_pool.release_cookie(cookie_id, error=True)
-                    raise HTTPException(status_code=response.status, detail="xstech API request failed")
+            # 更新会话活动时间
+            self.session_manager.last_activity[session_id] = time.time()
+            
+            # 返回session和response，由调用者负责关闭session
+            return http_session, response
                 
-                self.session_manager.last_activity[session_id] = time.time()
-                # 不在这里释放cookie，而是在处理完流式响应后
-                return response
-                
-        except Exception as e:
+        except aiohttp.ClientConnectionError as e:
+            logger.error(f"Connection error during chat completion for session {session_id}: {e}")
+            if http_session and not http_session.closed:
+                await http_session.close()
             self.cookie_pool.release_cookie(cookie_id, error=True)
-            logger.error(f"Error in chat completion: {e}")
+            raise HTTPException(status_code=503, detail=f"Service connection error: {e}")
+        except asyncio.TimeoutError as e:
+            logger.error(f"Timeout error during chat completion for session {session_id}: {e}")
+            if http_session and not http_session.closed:
+                await http_session.close()
+            self.cookie_pool.release_cookie(cookie_id, error=True)
+            raise HTTPException(status_code=504, detail=f"Request timed out: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error in chat completion for session {session_id}: {e}", exc_info=True)
+            if http_session and not http_session.closed:
+                await http_session.close()
+            # 只有在确认是cookie问题时才标记错误，否则可能只是临时网络问题
+            # self.cookie_pool.release_cookie(cookie_id, error=True) 
+            self.cookie_pool.release_cookie(cookie_id) # 暂时先不标记错误
             raise HTTPException(status_code=500, detail=f"Chat completion error: {str(e)}")
 
 # 处理图片数据
@@ -439,17 +472,24 @@ def generate_conversation_id(messages: List[ChatMessage]) -> str:
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest, background_tasks: BackgroundTasks):
     """处理聊天补全请求"""
+    http_session = None # Initialize http_session outside try
+    session_id = None   # Initialize session_id outside try
+    cookie_id = None    # Initialize cookie_id outside try
+    
     try:
         # 检查模型是否支持
         if not request.model.startswith("xstech-"):
-            # 尝试使用默认映射
-            xstech_model = request.model
+            xstech_model = xstech_client.reverse_model_map.get(request.model) # 尝试反向查找
+            if not xstech_model:
+                 # 如果反向查找不到，并且不是 xstech- 前缀，则报错
+                 raise HTTPException(status_code=400, detail=f"Model {request.model} not supported or invalid format. Use /v1/models to list supported models.")
         else:
-            xstech_model = xstech_client.model_map.get(request.model)
-            
-        if not xstech_model:
-            raise HTTPException(status_code=400, detail=f"Model {request.model} not supported")
-        
+             # 如果是 xstech- 前缀，正常查找
+            xstech_model_mapped = xstech_client.model_map.get(request.model)
+            if not xstech_model_mapped:
+                raise HTTPException(status_code=400, detail=f"Model {request.model} not found. Use /v1/models to list supported models.")
+            xstech_model = xstech_model_mapped # Use the mapped value
+
         # 从消息生成会话ID
         conversation_id = generate_conversation_id(request.messages)
         
@@ -476,175 +516,220 @@ async def create_chat_completion(request: ChatCompletionRequest, background_task
                 # 处理图片
                 files = process_image_content(last_message.content)
             
-            # 发送请求到xstech
-            response = await xstech_client.send_chat_completion(session_id, user_text, files)
+            # 获取会话关联的cookie_id，用于后续释放
+            if session_id in session_manager.sessions:
+                 cookie_id = session_manager.sessions[session_id]["cookie_id"]
+            else:
+                 # 这不应该发生，但作为保险措施
+                 raise HTTPException(status_code=500, detail="Internal session inconsistency")
+
+            # 发送请求到xstech，接收 session 和 response
+            http_session, response = await xstech_client.send_chat_completion(session_id, user_text, files)
             
-            # 如果是流式输出
-            if request.stream:
-                async def stream_generator():
-                    cookie_id = session_manager.sessions[session_id]["cookie_id"]
+            # --- 开始处理响应 ---
+            try:
+                # 如果是流式输出
+                if request.stream:
+                    async def stream_generator():
+                        ai_response = ""
+                        usage_info = {}
+                        stream_error = False
+                        try:
+                            # 处理SSE流
+                            async for line in response.content:
+                                line = line.decode('utf-8').strip()
+                                logger.debug(f"Stream raw line: {line}") # Debug log
+                                if not line:
+                                    continue
+
+                                if line.startswith("data: "):
+                                    data_text = line[6:]
+                                    if data_text == "[DONE]":
+                                        logger.info(f"Stream finished for session {session_id}")
+                                        break
+                                    
+                                    try:
+                                        data = json.loads(data_text)
+                                        logger.debug(f"Stream data: {data}") # Debug log
+                                        
+                                        # 处理字符串类型的数据
+                                        if data.get("type") == "string" and "data" in data:
+                                            chunk_content = data["data"]
+                                            ai_response += chunk_content
+                                            
+                                            # 创建OpenAI格式的流式响应
+                                            completion_chunk = {
+                                                "id": f"chatcmpl-{str(uuid.uuid4())}",
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": request.model,
+                                                "choices": [
+                                                    {
+                                                        "index": 0,
+                                                        "delta": { "content": chunk_content },
+                                                        "finish_reason": None
+                                                    }
+                                                ]
+                                            }
+                                            yield f"data: {json.dumps(completion_chunk)}\n\n"
+                                        
+                                        # 处理对象类型的数据（最后一条包含token使用情况）
+                                        elif data.get("type") == "object" and "data" in data:
+                                             # 记录最终的对象数据以备调试
+                                            logger.info(f"Stream final object data: {data['data']}")
+                                            usage_info = {
+                                                "prompt_tokens": data["data"].get("promptTokens", 0),
+                                                "completion_tokens": data["data"].get("completionTokens", 0),
+                                                "total_tokens": data["data"].get("useTokens", 0)
+                                            }
+                                            
+                                            # 发送最后一个chunk标记完成
+                                            final_chunk = {
+                                                "id": f"chatcmpl-{str(uuid.uuid4())}",
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": request.model,
+                                                "choices": [
+                                                    { "index": 0, "delta": {}, "finish_reason": "stop" }
+                                                ]
+                                            }
+                                            yield f"data: {json.dumps(final_chunk)}\n\n"
+                                            
+                                    except json.JSONDecodeError:
+                                        logger.error(f"Failed to parse SSE data: {data_text}")
+                                    except Exception as parse_err:
+                                        logger.error(f"Error processing SSE data chunk: {parse_err}", exc_info=True)
+                                        stream_error = True
+                                        break # Stop processing stream on error
+                                else:
+                                     logger.warning(f"Received non-SSE line: {line}") # Log unexpected lines
+
+                            # 只有在流成功完成且有响应时才记录历史
+                            if not stream_error and ai_response:
+                                session_manager.sessions[session_id]["messages"].append({ "role": "user", "content": user_text })
+                                session_manager.sessions[session_id]["messages"].append({ "role": "assistant", "content": ai_response })
+                                
+                        except aiohttp.ClientPayloadError as e:
+                             logger.error(f"Stream payload error for session {session_id}: {e}", exc_info=True)
+                             stream_error = True
+                        except Exception as e:
+                            logger.error(f"Error during stream processing for session {session_id}: {e}", exc_info=True)
+                            stream_error = True
+                        finally:
+                             # 确保即使生成器提前退出也关闭连接和释放cookie
+                            if http_session and not http_session.closed:
+                                await http_session.close()
+                                logger.info(f"HTTP session closed after stream for session {session_id}")
+                            if cookie_id:
+                                cookie_pool.release_cookie(cookie_id, error=stream_error)
+                                logger.info(f"Cookie {cookie_id} released after stream for session {session_id}, error={stream_error}")
+                            
+                        yield "data: [DONE]\n\n" # 必须在finally之后发送 [DONE]
+                        
+                    return StreamingResponse(stream_generator(), media_type="text/event-stream")
+                else:
+                    # 处理非流式请求
                     ai_response = ""
-                    usage_info = {}
+                    usage_info = { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+                    non_stream_error = False
                     
                     try:
-                        # 处理SSE流
+                        # 处理响应
                         async for line in response.content:
                             line = line.decode('utf-8').strip()
+                            logger.debug(f"Non-stream raw line: {line}") # Debug log
                             if not line or not line.startswith("data: "):
                                 continue
                             
                             data_text = line[6:]
                             if data_text == "[DONE]":
+                                logger.info(f"Non-stream finished for session {session_id}")
                                 break
                             
                             try:
                                 data = json.loads(data_text)
+                                logger.debug(f"Non-stream data: {data}") # Debug log
                                 
                                 # 处理字符串类型的数据
                                 if data.get("type") == "string" and "data" in data:
                                     ai_response += data["data"]
-                                    
-                                    # 创建OpenAI格式的流式响应
-                                    completion_chunk = {
-                                        "id": f"chatcmpl-{str(uuid.uuid4())}",
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": request.model,
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {
-                                                    "content": data["data"]
-                                                },
-                                                "finish_reason": None
-                                            }
-                                        ]
-                                    }
-                                    yield f"data: {json.dumps(completion_chunk)}\n\n"
                                 
-                                # 处理对象类型的数据（最后一条包含token使用情况）
+                                # 处理对象类型的数据（包含token使用情况）
                                 elif data.get("type") == "object" and "data" in data:
+                                    # 记录最终的对象数据以备调试
+                                    logger.info(f"Non-stream final object data: {data['data']}")
                                     usage_info = {
                                         "prompt_tokens": data["data"].get("promptTokens", 0),
                                         "completion_tokens": data["data"].get("completionTokens", 0),
                                         "total_tokens": data["data"].get("useTokens", 0)
                                     }
                                     
-                                    # 发送最后一个chunk标记完成
-                                    final_chunk = {
-                                        "id": f"chatcmpl-{str(uuid.uuid4())}",
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": request.model,
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {},
-                                                "finish_reason": "stop"
-                                            }
-                                        ]
-                                    }
-                                    yield f"data: {json.dumps(final_chunk)}\n\n"
-                                    
                             except json.JSONDecodeError:
-                                logger.error(f"Failed to parse SSE data: {data_text}")
-                        
-                        # 将消息添加到会话历史
-                        if ai_response:
-                            session_manager.sessions[session_id]["messages"].append({
-                                "role": "user",
-                                "content": user_text
-                            })
-                            session_manager.sessions[session_id]["messages"].append({
-                                "role": "assistant",
-                                "content": ai_response
-                            })
-                            
-                    except Exception as e:
-                        logger.error(f"Error in stream processing: {e}")
-                    finally:
-                        # 释放cookie
-                        cookie_pool.release_cookie(cookie_id)
-                        
-                    yield "data: [DONE]\n\n"
+                                logger.error(f"Failed to parse non-stream response data: {data_text}")
+                            except Exception as parse_err:
+                                logger.error(f"Error processing non-stream data chunk: {parse_err}", exc_info=True)
+                                non_stream_error = True
+                                break # Stop processing on error
                     
-                return StreamingResponse(stream_generator(), media_type="text/event-stream")
-            else:
-                # 处理非流式请求
-                cookie_id = session_manager.sessions[session_id]["cookie_id"]
-                ai_response = ""
-                usage_info = {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0
-                }
-                
-                try:
-                    # 处理响应
-                    async for line in response.content:
-                        line = line.decode('utf-8').strip()
-                        if not line or not line.startswith("data: "):
-                            continue
-                        
-                        data_text = line[6:]
-                        if data_text == "[DONE]":
-                            break
-                        
-                        try:
-                            data = json.loads(data_text)
+                    except aiohttp.ClientPayloadError as e:
+                         logger.error(f"Non-stream payload error for session {session_id}: {e}", exc_info=True)
+                         non_stream_error = True
+                    except Exception as e:
+                        logger.error(f"Error during non-stream processing for session {session_id}: {e}", exc_info=True)
+                        non_stream_error = True
+                    finally:
+                         # 确保关闭连接和释放cookie
+                        if http_session and not http_session.closed:
+                            await http_session.close()
+                            logger.info(f"HTTP session closed after non-stream for session {session_id}")
+                        if cookie_id:
+                            cookie_pool.release_cookie(cookie_id, error=non_stream_error)
+                            logger.info(f"Cookie {cookie_id} released after non-stream for session {session_id}, error={non_stream_error}")
                             
-                            # 处理字符串类型的数据
-                            if data.get("type") == "string" and "data" in data:
-                                ai_response += data["data"]
-                            
-                            # 处理对象类型的数据（包含token使用情况）
-                            elif data.get("type") == "object" and "data" in data:
-                                usage_info = {
-                                    "prompt_tokens": data["data"].get("promptTokens", 0),
-                                    "completion_tokens": data["data"].get("completionTokens", 0),
-                                    "total_tokens": data["data"].get("useTokens", 0)
-                                }
-                                
-                        except json.JSONDecodeError:
-                            logger.error(f"Failed to parse response data: {data_text}")
+                    # 只有在处理成功且有响应时才记录历史
+                    if not non_stream_error and ai_response:
+                        session_manager.sessions[session_id]["messages"].append({ "role": "user", "content": user_text })
+                        session_manager.sessions[session_id]["messages"].append({ "role": "assistant", "content": ai_response })
+                    
+                    # 返回OpenAI格式的响应
+                    return {
+                        "id": f"chatcmpl-{str(uuid.uuid4())}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": { "role": "assistant", "content": ai_response },
+                                "finish_reason": "stop" if not non_stream_error else "error"
+                            }
+                        ],
+                        "usage": usage_info
+                    }
+            
+            except Exception as e:
+                 # 处理响应过程中的其他异常
+                logger.error(f"Error processing response for session {session_id}: {e}", exc_info=True)
+                # 确保关闭和释放
+                if http_session and not http_session.closed:
+                    await http_session.close()
+                if cookie_id:
+                     cookie_pool.release_cookie(cookie_id, error=True)
+                raise HTTPException(status_code=500, detail=f"Error processing response: {str(e)}")
                 
-                finally:
-                    # 释放cookie
-                    cookie_pool.release_cookie(cookie_id)
-                
-                # 将消息添加到会话历史
-                if ai_response:
-                    session_manager.sessions[session_id]["messages"].append({
-                        "role": "user",
-                        "content": user_text
-                    })
-                    session_manager.sessions[session_id]["messages"].append({
-                        "role": "assistant",
-                        "content": ai_response
-                    })
-                
-                # 返回OpenAI格式的响应
-                return {
-                    "id": f"chatcmpl-{str(uuid.uuid4())}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": ai_response
-                            },
-                            "finish_reason": "stop"
-                        }
-                    ],
-                    "usage": usage_info
-                }
-                
+    except HTTPException as e:
+         # 对于已知HTTP异常，直接重新抛出
+        raise e
     except Exception as e:
-        logger.error(f"Error in chat completion: {e}")
-        raise HTTPException(status_code=500, detail=f"Chat completion error: {str(e)}")
+        # 捕获未预料的异常
+        logger.error(f"Unhandled error in chat completion endpoint: {e}", exc_info=True)
+        # 尝试释放cookie（如果已获取）
+        if cookie_id:
+             cookie_pool.release_cookie(cookie_id, error=True)
+        # 尝试关闭http session（如果已创建）
+        if http_session and not http_session.closed:
+            await http_session.close()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # 健康检查端点
 @app.get("/health")
