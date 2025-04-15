@@ -370,6 +370,64 @@ class XSTechClient:
             self.cookie_pool.release_cookie(cookie_id) # 暂时先不标记错误
             raise HTTPException(status_code=500, detail=f"Chat completion error: {str(e)}")
 
+    async def update_session_model(self, session_id: str, new_model: str) -> bool:
+        """更新XSTech会话使用的模型"""
+        if session_id not in self.session_manager.sessions:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        
+        session_data = self.session_manager.sessions[session_id]
+        cookie_id = session_data["cookie_id"]
+        cookie = next((c for c in self.cookie_pool.cookies if c["id"] == cookie_id), None)
+        
+        if not cookie:
+            raise HTTPException(status_code=503, detail="会话Cookie不可用")
+        
+        xstech_session_id = session_data["xstech_session_id"]
+        
+        try:
+            headers = {
+                "accept": "application/json, text/plain, */*",
+                "authorization": cookie["data"]["authorization"],
+                "content-type": "application/json",
+                "x-app-version": "2.1.1"
+            }
+            
+            # 构建请求体，保留现有会话设置但更新模型
+            body = {
+                "id": int(xstech_session_id),
+                "model": new_model,
+                # 可以添加更多默认参数
+                "contextCount": 10,
+                "temperature": 0,
+                "presencePenalty": 0,
+                "frequencyPenalty": 0,
+                "prompt": "",
+                "plugins": None,
+                "localPlugins": None,
+                "useAppId": 0
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.put(
+                    f"https://xstech.one/api/chat/session/{xstech_session_id}",
+                    headers=headers,
+                    json=body
+                ) as response:
+                    if response.status != 200:
+                        return False
+                    
+                    result = await response.json()
+                    if result.get("code") != 0:
+                        return False
+                    
+                    # 更新本地会话记录
+                    session_data["model"] = new_model
+                    return True
+                
+        except Exception as e:
+            logger.error(f"更新会话模型失败: {e}")
+            return False
+
 # 处理图片数据
 def process_image_content(content: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """处理OpenAI格式的图片内容，转换为xstech格式"""
@@ -495,6 +553,14 @@ async def create_chat_completion(request: ChatCompletionRequest, background_task
         
         # 获取或创建会话
         session_id = await session_manager.get_session_for_conversation(conversation_id, xstech_model)
+        
+        # 检查是否需要切换模型
+        current_model = session_manager.sessions[session_id]["model"]
+        if current_model != xstech_model:
+            logger.info(f"检测到模型切换请求: {current_model} -> {xstech_model}")
+            model_updated = await xstech_client.update_session_model(session_id, xstech_model)
+            if not model_updated:
+                logger.warning(f"模型切换失败，将继续使用当前模型: {current_model}")
         
         # 获取会话锁，确保并发安全
         session_lock = await session_manager.get_session_lock(session_id)
