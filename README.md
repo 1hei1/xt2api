@@ -23,8 +23,8 @@
 1. 克隆仓库
 
 ```bash
-git clone https://github.com/yourusername/xstech-openai-api.git
-cd xstech-openai-api
+git clone https://github.com/1hei1/xt2api.git
+cd xt2api
 ```
 
 2. 安装依赖
