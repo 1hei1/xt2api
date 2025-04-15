@@ -202,7 +202,7 @@ class SessionManager:
                     session_id = str(result["data"]["id"])
                     self.sessions[session_id] = {
                         "cookie_id": cookie["id"],
-                        "model": model,
+                        "model": result["data"]["model"],
                         "xstech_session_id": session_id,
                         "created_at": datetime.now(),
                         "messages": []
